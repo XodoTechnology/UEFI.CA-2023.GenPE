@@ -911,24 +911,42 @@ static int esp_inject(const WCHAR *volroot, const WCHAR *donor, int *wrote)
     return *wrote > 0;
 }
 
-/* candidate donor paths for a 2023-signed bootmgfw.efi */
+/* is the anchor CA a 2023 CA?  verify_efi returns the anchor's name; a
+ * 2011-signed file may chain to an enrolled 2011 CA - we want 2023 only. */
+static int is_2023_ca(const char *n)
+{
+    return n && strstr(n, "2023") != NULL;
+}
+
+/* candidate donor paths for a 2023-signed bootmgfw.efi: updated Windows
+ * staging dirs, install media, and other ESPs that already carry one */
 static int find_donor(WCHAR out[MAX_PATH])
 {
-    WCHAR letter, p[MAX_PATH];
+    WCHAR letter, p[MAX_PATH], vols[16][64];
     static const WCHAR *rel[] = {
         L"\\Windows\\Boot\\EFI\\bootmgfw.efi",
         L"\\efi\\microsoft\\boot\\bootmgfw.efi",
     };
     size_t r;
+    int nv, i;
     for (letter = L'C'; letter <= L'Z'; letter++)
         for (r = 0; r < 2; r++) {
             _snwprintf(p, MAX_PATH, L"%lc:%ls", letter, rel[r]);
             if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES &&
-                verify_efi(p)) {
+                is_2023_ca(verify_efi(p))) {
                 wcscpy(out, p);
                 return 1;
             }
         }
+    nv = find_windows_esps(vols, 16);
+    for (i = 0; i < nv; i++) {
+        _snwprintf(p, MAX_PATH, L"%lsEFI\\Microsoft\\Boot\\bootmgfw.efi",
+                   vols[i]);
+        if (is_2023_ca(verify_efi(p))) {
+            wcscpy(out, p);
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -937,7 +955,7 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
     const WCHAR *from = NULL, *espletter = NULL;
     int force = 0, i, wrote = 0, done = 0;
     WCHAR donor[MAX_PATH], vols[16][64];
-    int nvol;
+    int nvol = 0, nold = 0, outdated[16];
 
     for (i = 0; i < argc; i++) {
         if (!wcscmp(argv[i], L"--from") && i + 1 < argc) from = argv[++i];
@@ -949,6 +967,39 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
     msg("=====================================================");
 
     if (!is_elevated()) { msg("error: run elevated."); return 1; }
+
+    /* first (read-only): check what each ESP already has */
+    if (espletter) {
+        _snwprintf(vols[0], 64, L"%ls\\", espletter);
+        nvol = 1;
+    } else {
+        nvol = find_windows_esps(vols, 16);
+        if (!nvol) {
+            msg("error: no EFI System Partition with a Windows boot manager"
+                " found.");
+            return 1;
+        }
+    }
+    for (i = 0; i < nvol; i++) {
+        WCHAR p[MAX_PATH];
+        const char *ca;
+        _snwprintf(p, MAX_PATH, L"%lsEFI\\Microsoft\\Boot\\bootmgfw.efi",
+                   vols[i]);
+        ca = verify_efi(p);
+        outdated[i] = !is_2023_ca(ca);
+        if (!outdated[i])
+            msg("  ESP %d %ls: already 2023-signed (%s)", i + 1, vols[i], ca);
+        else
+            msg("  ESP %d %ls: %s", i + 1, vols[i],
+                ca ? "outdated signature" : "unsigned/unknown");
+        nold += outdated[i];
+    }
+    if (!nold) {
+        msg("All ESPs already have a 2023-signed boot manager.");
+        return 0;
+    }
+    msg("%d ESP(s) need a 2023-signed boot manager.", nold);
+
     if (!confirm_yes(argc, argv)) {
         msg("This copies boot files onto EFI System Partitions.");
         msg("Re-run with --yes to proceed.");
@@ -979,6 +1030,11 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
                     " Windows' \\Windows\\Boot\\EFI)");
                 return 1;
             }
+            if (!is_2023_ca(ca)) {
+                msg("error: %ls is signed by \"%s\" - not a 2023 CA.",
+                    donor, ca);
+                return 1;
+            }
             msg("  donor signature verified: chains to \"%s\"", ca);
         }
     } else {
@@ -1001,25 +1057,12 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
         return 1;
     }
 
-    /* target ESPs */
-    if (espletter) {
-        WCHAR root[8];
-        _snwprintf(root, 8, L"%ls\\", espletter);
-        msg("  target ESP: %ls (explicit)", root);
+    /* update only the outdated ESPs */
+    for (i = 0; i < nvol; i++) {
+        if (!outdated[i]) continue;
+        msg("  ESP %d: %ls", i + 1, vols[i]);
         wrote = 0;
-        if (esp_inject(root, donor, &wrote)) done = 1;
-    } else {
-        nvol = find_windows_esps(vols, 16);
-        if (!nvol) {
-            msg("error: no EFI System Partition with a Windows boot manager"
-                " found.");
-            return 1;
-        }
-        for (i = 0; i < nvol; i++) {
-            msg("  ESP %d: %ls", i + 1, vols[i]);
-            wrote = 0;
-            if (esp_inject(vols[i], donor, &wrote)) done = 1;
-        }
+        if (esp_inject(vols[i], donor, &wrote)) done = 1;
     }
 
     if (done) {
