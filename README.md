@@ -89,9 +89,13 @@ Certificates alone don't change what the machine boots — for that you need a
 
 1. Finds a donor: `--from <dir-or-file>`, or auto-detects the first
    `\Windows\Boot\EFI\bootmgfw.efi` (or `efi\microsoft\boot` on media) on any
-   drive that is **verifiably signed by a 2023 UEFI CA** (the PE security
-   directory must exist and contain the CA's CN — no unsigned/2011 file will
-   ever be deployed).
+   drive that passes **full Authenticode verification** — the tool parses the
+   PKCS#7 SignedData, RSA-verifies the signature over the signed attributes,
+   checks `messageDigest`, confirms the signed content embeds *this file's*
+   Authenticode PE hash, and verifies the certificate chain hop-by-hop up to
+   a CA that is enrolled in the device's `db` (or a known 2023 CA). Unsigned
+   files, 2011-signed files and forged signatures are all rejected, with a
+   reason shown when run with `-v`-style detail.
 2. Refuses to run unless a 2023 CA is already enrolled in `db` (`--force`
    overrides) — installing a loader the firmware can't verify bricks boot.
 3. Enumerates every ESP containing `\EFI\Microsoft\Boot\bootmgfw.efi` via
@@ -140,13 +144,17 @@ On Windows with mingw-w64 installed, the same Makefile works under MSYS2.
 ## Layout
 
 ```
-src/genpe.c        the tool (UEFI var I/O, registry, CLI)
+src/genpe.c        the tool (UEFI var I/O, registry, ESP update, CLI)
 src/sigparse.h     EFI_SIGNATURE_LIST parsing + PK->KEK map lookup
+src/sigcheck.h     PKCS#7/Authenticode signature + chain verification
+src/der.h          minimal ASN.1/DER reader
+src/bignum.h       tiny bignum + RSASSA-PKCS1-v1_5 verify
 src/sha1.h         tiny SHA-1 (cert thumbprints)
+src/sha256.h       tiny SHA-256 (signature digests)
 src/generated/     payloads.S / payloads.h (generated, do not edit)
 tools/embed.py     embeds payloads/*.bin into the binary
 payloads/          Microsoft-signed update .bin files + kek_map.json
-tests/             native unit test for parsing/map logic
+tests/             native unit tests (parsing/map + signature verification)
 ```
 
 ## Payload provenance

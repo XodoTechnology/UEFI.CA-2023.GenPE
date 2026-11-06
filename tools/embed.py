@@ -155,6 +155,28 @@ def main():
             f.write("  { { %s }, \"%s\" },\n" % (c_bytes(h), name))
         f.write("};\n#define KNOWN_CERT_COUNT %d\n\n" % len(known))
 
+        # CA certificate DERs as trust anchors for Authenticode chain
+        # verification (point into the embedded payloads, no extra bytes).
+        # entries: pointer into a payload, DER length, display name
+        f.write("typedef struct { const unsigned char *der; unsigned int len;"
+                " const char *name; } ca_cert_t;\n")
+        f.write("static const ca_cert_t g_ca_certs[] = {\n")
+        seen_der = set()
+        for sym, fs, _ in files:
+            if not (sym.startswith("g_kek_") or sym.startswith("g_db_")):
+                continue
+            for der in siglist_ders(authvar_content(blob[sym])):
+                h = hashlib.sha1(der).digest()
+                if h in seen_der:
+                    continue
+                seen_der.add(h)
+                name = next((n for h2, n in known if h2 == h), None)
+                off = blob[sym].find(der)
+                f.write("  { %s + %d, %d, %s },\n"
+                        % (sym, off, len(der),
+                           ("\"%s\"" % name) if name else "NULL"))
+        f.write("};\n#define CA_CERT_COUNT %d\n\n" % len(seen_der))
+
         f.write("typedef struct { const char *name; const unsigned char *data;"
                 " unsigned int len; } payload_item_t;\n")
         f.write("static const payload_item_t g_payload_items[] = {\n")

@@ -211,6 +211,7 @@ static int uefi_available(void)
 }
 
 #include "sigparse.h"
+#include "sigcheck.h"
 
 /* ------------------------------------------------------------------ */
 /* registry                                                            */
@@ -815,45 +816,41 @@ static unsigned char *slurp_file(const WCHAR *path, DWORD *outn)
     return b;
 }
 
-/* does the PE's signature embed a CN string?  Heuristic: require the file
- * to have a security directory, then scan the whole file for the CN as
- * UTF-8 or UTF-16LE (Authenticode PKCS7 may store either). */
-static int pe_signed_by(const WCHAR *path, const char *cn)
+/* trust-anchor check for Authenticode chain verification: accepts a CA
+ * cert if it is enrolled in the device's db right now, or matches an
+ * embedded 2023 CA (for offline analysis / pre-enrollment). */
+struct anchor_ctx { const unsigned char *db; DWORD dblen; };
+static const char *anchor_ok(const unsigned char *der, size_t len, void *vctx)
 {
-    DWORD n = 0, i, secva = 0, secsz = 0, eoff;
-    unsigned char *b = slurp_file(path, &n);
-    size_t cnl = strlen(cn);
-    int found = 0;
+    struct anchor_ctx *c = vctx;
+    unsigned char h[20];
+    unsigned int i;
+    const char *kn;
+    sha1(der, len, h);
+    kn = known_cert_name(h);
+    if (c->db && var_has_cert(c->db, c->dblen, h))
+        return kn ? kn : "enrolled CA";
+    for (i = 0; i < CA_CERT_COUNT; i++)
+        if (g_ca_certs[i].len == len &&
+            !memcmp(g_ca_certs[i].der, der, len))
+            return g_ca_certs[i].name ? g_ca_certs[i].name : "2023 CA";
+    return NULL;
+}
 
-    if (!b) return 0;
-    if (n > 0x40 && b[0] == 'M' && b[1] == 'Z') {
-        eoff = rd32(b + 0x3c);
-        if (eoff + 0x98 < n && !memcmp(b + eoff, "PE\0\0", 4)) {
-            unsigned int magic = b[eoff + 24] | b[eoff + 25] << 8;
-            unsigned int dd = eoff + 24 + (magic == 0x20b ? 112 : 96);
-            if (dd + 40 < n) {
-                secva = rd32(b + dd + 32);   /* security dir = file offset */
-                secsz = rd32(b + dd + 36);
-            }
-        }
-    }
-    if (secva && secsz) {
-        for (i = 0; i + cnl <= n; i++) {
-            size_t j;
-            if (b[i] == (unsigned char)cn[0] && !memcmp(b + i, cn, cnl)) {
-                found = 1; break;
-            }
-            if (b[i] == (unsigned char)cn[0] && !b[i + 1]) {
-                for (j = 0; j < cnl; j++)
-                    if (b[i + j * 2] != (unsigned char)cn[j] ||
-                        b[i + j * 2 + 1] != 0)
-                        break;
-                if (j == cnl) { found = 1; break; }
-            }
-        }
-    }
+/* cryptographically verify a PE's Authenticode signature chains to a
+ * Secure Boot CA.  Returns CA name or NULL. */
+static const char *verify_efi(const WCHAR *path)
+{
+    DWORD n = 0;
+    unsigned char *b = slurp_file(path, &n);
+    struct anchor_ctx c = { NULL, 0 };
+    const char *r;
+    if (!b) return NULL;
+    c.db = read_var(L"db", G_IMGDB, &c.dblen, NULL);
+    r = efi_sig_verify(b, n, anchor_ok, &c);
+    free((void *)c.db);
     free(b);
-    return found;
+    return r;
 }
 
 /* enumerate \\?\Volume{guid}\ paths containing a Windows boot manager */
@@ -915,9 +912,7 @@ static int find_donor(WCHAR out[MAX_PATH])
         for (r = 0; r < 2; r++) {
             _snwprintf(p, MAX_PATH, L"%lc:%ls", letter, rel[r]);
             if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES &&
-                (pe_signed_by(p, "Windows UEFI CA 2023") ||
-                 pe_signed_by(p, "Microsoft UEFI CA 2023") ||
-                 pe_signed_by(p, "Microsoft Corporation UEFI CA 2023"))) {
+                verify_efi(p)) {
                 wcscpy(out, p);
                 return 1;
             }
@@ -963,14 +958,16 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
             msg("error: no bootmgfw.efi at %ls", donor);
             return 1;
         }
-        if (!force && !pe_signed_by(donor, "Windows UEFI CA 2023") &&
-            !pe_signed_by(donor, "Microsoft UEFI CA 2023") &&
-            !pe_signed_by(donor, "Microsoft Corporation UEFI CA 2023")) {
-            msg("error: %ls does not appear to be signed by a 2023 UEFI CA.",
-                donor);
-            msg("       (--force to override; get one from an updated"
-                " Windows' \\Windows\\Boot\\EFI)");
-            return 1;
+        if (!force) {
+            const char *ca = verify_efi(donor);
+            if (!ca) {
+                msg("error: %ls has no valid signature chaining to a"
+                    " Secure Boot CA (%s).", donor, sigcheck_last_error());
+                msg("       (--force to override; get one from an updated"
+                    " Windows' \\Windows\\Boot\\EFI)");
+                return 1;
+            }
+            msg("  donor signature verified: chains to \"%s\"", ca);
         }
     } else {
         if (!find_donor(donor)) {

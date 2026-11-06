@@ -32,15 +32,19 @@ build/GenPE32.exe: src/genpe.c src/sha1.h src/generated/payloads.h build/payload
 build:
 	mkdir -p build
 
-# native (Linux) build of the parsing unit test against real payloads
-test: build/test_parse
+# native (Linux) build of the parsing + signature unit tests
+test: build/test_parse build/test_sigcheck
 	./build/test_parse
+	./build/test_sigcheck
 
 build/payloads_test.o: src/generated/payloads.S | build
 	gcc -c $< -o $@
 
 build/test_parse: tests/test_parse.c src/sigparse.h src/sha1.h src/generated/payloads.h build/payloads_test.o | build
 	gcc -O0 -g -Isrc -o $@ tests/test_parse.c build/payloads_test.o
+
+build/test_sigcheck: tests/test_sigcheck.c src/sigcheck.h src/bignum.h src/der.h src/sha1.h src/sha256.h | build
+	gcc -O0 -g -Isrc -o $@ tests/test_sigcheck.c
 
 clean:
 	rm -rf build src/generated/payloads.h src/generated/payloads.S
