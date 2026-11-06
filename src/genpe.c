@@ -50,24 +50,36 @@
 
 static int g_verbose;
 
+/* when set (GUI mode), all output goes here instead of stdout/stderr */
+static void (*g_msgfn)(const char *line);
+
+static void emit(const char *line)
+{
+    if (g_msgfn) g_msgfn(line);
+    else         fputs(line, stdout);
+}
+
 static void vlog(const char *fmt, ...)
 {
+    char buf[2048] = "  [dbg] ";
     va_list ap;
     if (!g_verbose) return;
     va_start(ap, fmt);
-    fprintf(stderr, "  [dbg] ");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    vsnprintf(buf + 8, sizeof(buf) - 10, fmt, ap);
     va_end(ap);
+    strcat(buf, "\n");
+    emit(buf);
 }
 
 static void msg(const char *fmt, ...)
 {
+    char buf[2048];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stdout, fmt, ap);
-    fputc('\n', stdout);
+    vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
     va_end(ap);
+    strcat(buf, "\n");
+    emit(buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1021,12 +1033,197 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* minimal Win32 GUI (still system DLLs only)                          */
+/* ------------------------------------------------------------------ */
+
+#include <commctrl.h>
+
+enum {
+    IDC_STATUS = 1001, IDC_INSTALL, IDC_BOOTFILES, IDC_SCAN,
+    IDC_MARK, IDC_OPTIN, IDC_DRIVE, IDC_LOG, IDC_REFRESH
+};
+
+static HWND g_logedit, g_driveedit, g_hwnd;
+
+/* append a UTF-8 line to the log pane (adds CRLF) */
+static void gui_out(const char *s)
+{
+    WCHAR w[4096];
+    char tmp[2200];
+    size_t i, j;
+    for (i = 0, j = 0; s[i] && j < sizeof(tmp) - 3; i++) {
+        if (s[i] == '\n') { tmp[j++] = '\r'; tmp[j++] = '\n'; }
+        else tmp[j++] = s[i];
+    }
+    tmp[j] = 0;
+    MultiByteToWideChar(CP_UTF8, 0, tmp, -1, w, 4096);
+    {
+        int len = GetWindowTextLengthW(g_logedit);
+        SendMessageW(g_logedit, EM_SETSEL, len, len);
+        SendMessageW(g_logedit, EM_REPLACESEL, 0, (LPARAM)w);
+        SendMessageW(g_logedit, EM_SCROLLCARET, 0, 0);
+    }
+}
+
+static void gui_drive(WCHAR *out, int cap)
+{
+    GetWindowTextW(g_driveedit, out, cap);
+    if (out[0] == 0) wcscpy(out, L"C:");
+    else if (out[0] >= 'a' && out[0] <= 'z') out[0] -= 'a' - 'A';
+}
+
+static void gui_exec(int (*fn)(void))
+{
+    g_msgfn = gui_out;
+    SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    fn();
+    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+    g_msgfn = NULL;
+    gui_out("\r\n");
+}
+
+static void gui_exec_argv(int (*fn)(int, WCHAR **), int argc, WCHAR **argv)
+{
+    g_msgfn = gui_out;
+    SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    fn(argc, argv);
+    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+    g_msgfn = NULL;
+    gui_out("\r\n");
+}
+
+static int gui_yes(LPCWSTR what)
+{
+    return MessageBoxW(g_hwnd, what, L"GenPE - confirm",
+                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+}
+
+static int gui_mark_wrap(int c, WCHAR **v) { return cmd_mark_optin(c, v, 0); }
+static int gui_optin_wrap(int c, WCHAR **v) { return cmd_mark_optin(c, v, 1); }
+
+static LRESULT CALLBACK gui_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    if (m == WM_COMMAND) {
+        WCHAR d[8];
+        WCHAR *a[8];
+        switch (LOWORD(wp)) {
+        case IDC_STATUS:   gui_exec(cmd_status); break;
+        case IDC_SCAN:     gui_exec(cmd_scan); break;
+        case IDC_INSTALL:
+            if (gui_yes(L"Write the 2023 CA certificates to UEFI KEK + db "
+                        L"now?\n\n(append-only; existing keys are kept)")) {
+                a[0] = L"--yes";
+                gui_exec_argv(cmd_install, 1, a);
+            }
+            break;
+        case IDC_BOOTFILES:
+            if (gui_yes(L"Install the 2023-signed boot manager onto the "
+                        L"ESP?\n\nHave BitLocker recovery keys ready before "
+                        L"the next reboot.")) {
+                a[0] = L"--yes";
+                gui_exec_argv(cmd_bootfiles, 1, a);
+            }
+            break;
+        case IDC_MARK:
+            gui_drive(d, 8);
+            a[0] = d;
+            gui_exec_argv(gui_mark_wrap, 1, a);
+            break;
+        case IDC_OPTIN:
+            gui_drive(d, 8);
+            a[0] = d;
+            gui_exec_argv(gui_optin_wrap, 1, a);
+            break;
+        }
+    } else if (m == WM_DESTROY) {
+        PostQuitMessage(0);
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static HWND mk(HWND parent, LPCWSTR cls, LPCWSTR txt, DWORD style,
+               int x, int y, int w, int hgt, int id)
+{
+    return CreateWindowExW(0, cls, txt,
+        style | WS_CHILD | WS_VISIBLE, x, y, w, hgt, parent,
+        (HMENU)(UINT_PTR)id, NULL, NULL);
+}
+
+static int gui_main(void)
+{
+    WNDCLASSW wc;
+    HWND h;
+    HFONT mono, norm;
+    MSG m;
+
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&icc);
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = gui_wndproc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"GenPEWindow";
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    RegisterClassW(&wc);
+
+    g_hwnd = h = CreateWindowExW(0, L"GenPEWindow",
+        L"GenPE - UEFI CA 2023 Secure Boot updater",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+        WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 700, 520,
+        NULL, NULL, wc.hInstance, NULL);
+
+    norm = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    mono = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                       0, 0, 0, 0, L"Consolas");
+
+    mk(h, L"STATIC", L"Actions:", 0, 10, 10, 60, 20, -1);
+    mk(h, L"BUTTON", L"Status", 0, 10, 32, 100, 26, IDC_STATUS);
+    mk(h, L"BUTTON", L"Scan disks", 0, 116, 32, 100, 26, IDC_SCAN);
+    mk(h, L"BUTTON", L"Install 2023 certs", 0, 222, 32, 130, 26, IDC_INSTALL);
+    mk(h, L"BUTTON", L"Update boot files", 0, 358, 32, 130, 26, IDC_BOOTFILES);
+
+    mk(h, L"STATIC", L"OS drive:", 0, 10, 66, 60, 20, -1);
+    g_driveedit = mk(h, L"EDIT", L"C:", WS_BORDER | ES_AUTOHSCROLL,
+                     72, 64, 40, 22, IDC_DRIVE);
+    mk(h, L"BUTTON", L"Mark OS updated", 0, 118, 64, 130, 26, IDC_MARK);
+    mk(h, L"BUTTON", L"Opt-in OS updates", 0, 254, 64, 130, 26, IDC_OPTIN);
+
+    g_logedit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
+        ES_AUTOVSCROLL,
+        10, 100, 664, 360, h, (HMENU)IDC_LOG, NULL, NULL);
+
+    {
+        HWND c = NULL;
+        for (c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+            SendMessageW(c, WM_SETFONT, (WPARAM)norm, 1);
+        SendMessageW(g_logedit, WM_SETFONT, (WPARAM)mono, 1);
+    }
+
+    g_msgfn = gui_out;
+    gui_out(is_elevated()
+            ? "Running elevated - firmware + registry writes allowed.\r\n"
+            : "NOT elevated - read-only. Restart as administrator.\r\n");
+    g_msgfn = NULL;
+
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 
 static int usage(void)
 {
     msg(
 "GenPE - UEFI CA 2023 Secure Boot updater (for Windows / WinPE)\n"
 "\n"
+"  genpe                             Launch the GUI (also: genpe gui)\n"
 "  genpe status                      Show Secure Boot certs + OS servicing state\n"
 "  genpe scan                        List Windows installs on attached disks\n"
 "  genpe install --yes               Enroll KEK 2023 + db 2023 CAs, mark OS updated\n"
@@ -1062,7 +1259,8 @@ int wmain(int argc, WCHAR **argv)
 
     grab_privileges();
 
-    if (argc < 2) return usage();
+    if (argc < 2) return gui_main();
+    if (!wcscmp(argv[1], L"gui")) return gui_main();
     if (!wcscmp(argv[1], L"status")) return cmd_status();
     if (!wcscmp(argv[1], L"scan")) return cmd_scan();
     if (!wcscmp(argv[1], L"install")) return cmd_install(argc - 2, argv + 2);

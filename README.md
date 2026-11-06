@@ -32,7 +32,12 @@ preserved.
 
 ## Usage
 
+Run `GenPE.exe` with no arguments (or `genpe gui`) for a point-and-click GUI —
+buttons for status / cert install / boot-file update / OS marking, output in a
+log pane. Everything below is the CLI, identical under the hood:
+
 ```
+genpe                             Launch the GUI (also: genpe gui)
 genpe status                      Show Secure Boot certs + OS servicing state
 genpe scan                        List Windows installs on attached disks
 genpe install --yes               Enroll KEK 2023 + db 2023 CAs, mark OS updated

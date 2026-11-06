@@ -6,7 +6,9 @@ X64CC   ?= x86_64-w64-mingw32-gcc
 X86CC   ?= i686-w64-mingw32-gcc
 CFLAGS   = -Os -Wall -Wextra -Wno-unused-parameter -Isrc
 LDFLAGS  = -municode -static -s -Wl,--gc-sections
-LIBS     = -ladvapi32
+LIBS     = -ladvapi32 -luser32 -lgdi32 -lcomctl32
+WINDRES64 ?= x86_64-w64-mingw32-windres
+WINDRES32 ?= i686-w64-mingw32-windres
 
 GEN      = src/generated/payloads.h src/generated/payloads.S
 
@@ -23,11 +25,17 @@ build/payloads64.o: src/generated/payloads.S | build
 build/payloads32.o: src/generated/payloads.S | build
 	$(X86CC) -c $< -o $@
 
-build/GenPE.exe: src/genpe.c src/sha1.h src/generated/payloads.h build/payloads64.o | build
-	$(X64CC) $(CFLAGS) -o $@ src/genpe.c build/payloads64.o $(LDFLAGS) $(LIBS)
+build/genpe64.res: src/genpe.rc src/genpe.manifest | build
+	$(WINDRES64) -Isrc src/genpe.rc -O coff -o $@
 
-build/GenPE32.exe: src/genpe.c src/sha1.h src/generated/payloads.h build/payloads32.o | build
-	$(X86CC) $(CFLAGS) -o $@ src/genpe.c build/payloads32.o $(LDFLAGS) $(LIBS)
+build/genpe32.res: src/genpe.rc src/genpe.manifest | build
+	$(WINDRES32) -Isrc src/genpe.rc -O coff -o $@
+
+build/GenPE.exe: src/genpe.c src/sha1.h src/generated/payloads.h build/payloads64.o build/genpe64.res | build
+	$(X64CC) $(CFLAGS) -o $@ src/genpe.c build/payloads64.o build/genpe64.res $(LDFLAGS) $(LIBS)
+
+build/GenPE32.exe: src/genpe.c src/sha1.h src/generated/payloads.h build/payloads32.o build/genpe32.res | build
+	$(X86CC) $(CFLAGS) -o $@ src/genpe.c build/payloads32.o build/genpe32.res $(LDFLAGS) $(LIBS)
 
 build:
 	mkdir -p build
