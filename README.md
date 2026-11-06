@@ -44,6 +44,9 @@ genpe mark [X:] [--pending]       Mark an OS Updated (or Pending) — running
                                   OS if no drive, offline OS at X:\ otherwise
 genpe optin [X:] [--mask 0x5944]  Set AvailableUpdates so OS servicing applies
                                   the certs on next boot
+genpe bootfiles --yes             Copy a 2023-signed boot manager onto the ESP
+    --from <dir-or-file>            donor bootmgfw.efi (auto-detected if omitted)
+    --esp X:                        only this ESP (default: all Windows ESPs)
 genpe dump [name [out.bin]]       List / extract an embedded signed payload
 genpe apply <PK|KEK|db|dbx> file  Apply an external signed payload (--yes;
                                   --replace to overwrite instead of append)
@@ -52,10 +55,11 @@ genpe apply <PK|KEK|db|dbx> file  Apply an external signed payload (--yes;
 ### Typical WinPE flow
 
 ```bat
-X:\> GenPE.exe status          :: see what's enrolled / missing
-X:\> GenPE.exe install --yes   :: KEK 2023 + Windows UEFI CA 2023 + MS UEFI CA 2023
-X:\> GenPE.exe scan            :: find offline Windows installs on the disks
-X:\> GenPE.exe mark C:         :: tell that OS it's updated (writes its registry)
+X:\> GenPE.exe status           :: see what's enrolled / missing
+X:\> GenPE.exe install --yes    :: KEK 2023 + Windows UEFI CA 2023 + MS UEFI CA 2023
+X:\> GenPE.exe bootfiles --yes  :: swap in the 2023-signed boot manager on the ESP
+X:\> GenPE.exe scan             :: find offline Windows installs on the disks
+X:\> GenPE.exe mark C:          :: tell that OS it's updated (writes its registry)
 ```
 
 Or, to leave the firmware alone and let an offline OS update itself at next
@@ -78,6 +82,26 @@ X:\> GenPE.exe optin D:        :: writes AvailableUpdates=0x5944 into D:'s SYSTE
    `UEFICA2023Status="Updated"`, `UEFICA2023Error=0`, `AvailableUpdates=0`
    unless `--no-mark`.
 
+### Boot manager update (`bootfiles`)
+
+Certificates alone don't change what the machine boots — for that you need a
+2023-signed `bootmgfw.efi` on the ESP. `genpe bootfiles --yes`:
+
+1. Finds a donor: `--from <dir-or-file>`, or auto-detects the first
+   `\Windows\Boot\EFI\bootmgfw.efi` (or `efi\microsoft\boot` on media) on any
+   drive that is **verifiably signed by a 2023 UEFI CA** (the PE security
+   directory must exist and contain the CA's CN — no unsigned/2011 file will
+   ever be deployed).
+2. Refuses to run unless a 2023 CA is already enrolled in `db` (`--force`
+   overrides) — installing a loader the firmware can't verify bricks boot.
+3. Enumerates every ESP containing `\EFI\Microsoft\Boot\bootmgfw.efi` via
+   volume GUIDs (no drive letter needed, works in WinPE), backs each file up
+   as `.genpebak`, then updates `bootmgfw.efi` and the `bootx64.efi` fallback
+   if present.
+
+Typical donor sources: an already-updated Windows install
+(`D:\Windows\Boot\EFI`), 2023-refreshed install media, or the running OS.
+
 ### Offline OS marking
 
 `genpe mark X:` mounts `X:\Windows\System32\config\SYSTEM` under a temporary
@@ -91,9 +115,8 @@ servicing performs the rollout at first boot.
 
 - **Back up BitLocker recovery keys** before changing Secure Boot state.
 - `--dbx-svn` / `--dbx-2024` revoke pre-2023 Windows boot managers. Only use
-  them after a Windows UEFI CA 2023-signed boot manager is on the ESP — the
-  tool warns and requires the db update first, but **you** are responsible for
-  the boot files. The standard `optin` path lets Microsoft handle ordering.
+  them **after** `bootfiles` (or Microsoft's servicing) has placed a
+  2023-signed boot manager on the ESP — otherwise the device won't boot.
 - Devices with a PK not in Microsoft's vendor map can't get a signed KEK
   update this way; `status` tells you, and `apply` accepts an OEM-provided
   signed payload.

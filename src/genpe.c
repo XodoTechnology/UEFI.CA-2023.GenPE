@@ -791,6 +791,239 @@ static int cmd_apply(int argc, WCHAR **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* ESP / 2023-signed boot manager update                               */
+/* ------------------------------------------------------------------ */
+
+/* read a file fully (cap 16MB) */
+static unsigned char *slurp_file(const WCHAR *path, DWORD *outn)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    unsigned char *b;
+    DWORD sz, rd = 0;
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    sz = GetFileSize(f, NULL);
+    if (sz > 16 * 1024 * 1024 || !(b = malloc(sz))) {
+        CloseHandle(f); return NULL;
+    }
+    if (!ReadFile(f, b, sz, &rd, NULL) || rd != sz) {
+        CloseHandle(f);
+        free(b); return NULL;
+    }
+    CloseHandle(f);
+    *outn = sz;
+    return b;
+}
+
+/* does the PE's signature embed a CN string?  Heuristic: require the file
+ * to have a security directory, then scan the whole file for the CN as
+ * UTF-8 or UTF-16LE (Authenticode PKCS7 may store either). */
+static int pe_signed_by(const WCHAR *path, const char *cn)
+{
+    DWORD n = 0, i, secva = 0, secsz = 0, eoff;
+    unsigned char *b = slurp_file(path, &n);
+    size_t cnl = strlen(cn);
+    int found = 0;
+
+    if (!b) return 0;
+    if (n > 0x40 && b[0] == 'M' && b[1] == 'Z') {
+        eoff = rd32(b + 0x3c);
+        if (eoff + 0x98 < n && !memcmp(b + eoff, "PE\0\0", 4)) {
+            unsigned int magic = b[eoff + 24] | b[eoff + 25] << 8;
+            unsigned int dd = eoff + 24 + (magic == 0x20b ? 112 : 96);
+            if (dd + 40 < n) {
+                secva = rd32(b + dd + 32);   /* security dir = file offset */
+                secsz = rd32(b + dd + 36);
+            }
+        }
+    }
+    if (secva && secsz) {
+        for (i = 0; i + cnl <= n; i++) {
+            size_t j;
+            if (b[i] == (unsigned char)cn[0] && !memcmp(b + i, cn, cnl)) {
+                found = 1; break;
+            }
+            if (b[i] == (unsigned char)cn[0] && !b[i + 1]) {
+                for (j = 0; j < cnl; j++)
+                    if (b[i + j * 2] != (unsigned char)cn[j] ||
+                        b[i + j * 2 + 1] != 0)
+                        break;
+                if (j == cnl) { found = 1; break; }
+            }
+        }
+    }
+    free(b);
+    return found;
+}
+
+/* enumerate \\?\Volume{guid}\ paths containing a Windows boot manager */
+static int find_windows_esps(WCHAR vols[][64], int max)
+{
+    WCHAR v[64];
+    HANDLE h = FindFirstVolumeW(v, 64);
+    int n = 0;
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        WCHAR p[MAX_PATH];
+        _snwprintf(p, MAX_PATH, L"%lsEFI\\Microsoft\\Boot\\bootmgfw.efi", v);
+        if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES && n < max)
+            wcscpy(vols[n++], v);
+    } while (FindNextVolumeW(h, v, 64) && n < max);
+    FindVolumeClose(h);
+    return n;
+}
+
+static int esp_inject(const WCHAR *volroot, const WCHAR *donor, int *wrote)
+{
+    static const WCHAR *targets[] = {
+        L"EFI\\Microsoft\\Boot\\bootmgfw.efi",
+        L"EFI\\Boot\\bootx64.efi",
+    };
+    size_t i;
+    for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        WCHAR dst[MAX_PATH], bak[MAX_PATH];
+        _snwprintf(dst, MAX_PATH, L"%ls%ls", volroot, targets[i]);
+        if (GetFileAttributesW(dst) == INVALID_FILE_ATTRIBUTES) continue;
+        _snwprintf(bak, MAX_PATH, L"%ls.genpebak", dst);
+        if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES &&
+            !CopyFileW(dst, bak, TRUE)) {
+            msg("      ! backup of %ls failed (err %lu) - skipping", dst,
+                (unsigned long)GetLastError());
+            continue;
+        }
+        if (!CopyFileW(donor, dst, FALSE)) {
+            msg("      ! write to %ls failed (err %lu)", dst,
+                (unsigned long)GetLastError());
+            continue;
+        }
+        msg("      updated %ls (backup: %ls)", dst, bak);
+        (*wrote)++;
+    }
+    return *wrote > 0;
+}
+
+/* candidate donor paths for a 2023-signed bootmgfw.efi */
+static int find_donor(WCHAR out[MAX_PATH])
+{
+    WCHAR letter, p[MAX_PATH];
+    static const WCHAR *rel[] = {
+        L"\\Windows\\Boot\\EFI\\bootmgfw.efi",
+        L"\\efi\\microsoft\\boot\\bootmgfw.efi",
+    };
+    size_t r;
+    for (letter = L'C'; letter <= L'Z'; letter++)
+        for (r = 0; r < 2; r++) {
+            _snwprintf(p, MAX_PATH, L"%lc:%ls", letter, rel[r]);
+            if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES &&
+                (pe_signed_by(p, "Windows UEFI CA 2023") ||
+                 pe_signed_by(p, "Microsoft UEFI CA 2023") ||
+                 pe_signed_by(p, "Microsoft Corporation UEFI CA 2023"))) {
+                wcscpy(out, p);
+                return 1;
+            }
+        }
+    return 0;
+}
+
+static int cmd_bootfiles(int argc, WCHAR **argv)
+{
+    const WCHAR *from = NULL, *espletter = NULL;
+    int force = 0, i, wrote = 0, done = 0;
+    WCHAR donor[MAX_PATH], vols[16][64];
+    int nvol;
+
+    for (i = 0; i < argc; i++) {
+        if (!wcscmp(argv[i], L"--from") && i + 1 < argc) from = argv[++i];
+        else if (!wcscmp(argv[i], L"--esp") && i + 1 < argc) espletter = argv[++i];
+        else if (!wcscmp(argv[i], L"--force")) force = 1;
+    }
+
+    msg("Install a 2023-signed Windows boot manager on the ESP");
+    msg("=====================================================");
+
+    if (!is_elevated()) { msg("error: run elevated."); return 1; }
+    if (!confirm_yes(argc, argv)) {
+        msg("This copies boot files onto EFI System Partitions.");
+        msg("Re-run with --yes to proceed.");
+        return 2;
+    }
+
+    /* donor file */
+    if (from) {
+        DWORD at = GetFileAttributesW(from);
+        if (at == INVALID_FILE_ATTRIBUTES) {
+            msg("error: donor path %ls not found", from);
+            return 1;
+        }
+        if (at & FILE_ATTRIBUTE_DIRECTORY)
+            _snwprintf(donor, MAX_PATH, L"%ls\\bootmgfw.efi", from);
+        else
+            wcscpy(donor, from);
+        if (GetFileAttributesW(donor) == INVALID_FILE_ATTRIBUTES) {
+            msg("error: no bootmgfw.efi at %ls", donor);
+            return 1;
+        }
+        if (!force && !pe_signed_by(donor, "Windows UEFI CA 2023") &&
+            !pe_signed_by(donor, "Microsoft UEFI CA 2023") &&
+            !pe_signed_by(donor, "Microsoft Corporation UEFI CA 2023")) {
+            msg("error: %ls does not appear to be signed by a 2023 UEFI CA.",
+                donor);
+            msg("       (--force to override; get one from an updated"
+                " Windows' \\Windows\\Boot\\EFI)");
+            return 1;
+        }
+    } else {
+        if (!find_donor(donor)) {
+            msg("error: no 2023-signed bootmgfw.efi found on any"
+                " \\Windows\\Boot\\EFI or boot media ESP.");
+            msg("       Supply one with --from <dir-or-file> (e.g. an updated"
+                " Windows install or install media).");
+            return 1;
+        }
+    }
+    msg("  donor: %ls", donor);
+
+    /* db must trust the signer or the machine will not boot */
+    if (!cert_present_in(L"db", G_IMGDB, "Windows UEFI CA 2023") &&
+        !cert_present_in(L"db", G_IMGDB, "Microsoft UEFI CA 2023") &&
+        !force) {
+        msg("error: no 2023 UEFI CA is enrolled in db yet.");
+        msg("       Run 'genpe install --yes' first, or --force to override.");
+        return 1;
+    }
+
+    /* target ESPs */
+    if (espletter) {
+        WCHAR root[8];
+        _snwprintf(root, 8, L"%ls\\", espletter);
+        msg("  target ESP: %ls (explicit)", root);
+        wrote = 0;
+        if (esp_inject(root, donor, &wrote)) done = 1;
+    } else {
+        nvol = find_windows_esps(vols, 16);
+        if (!nvol) {
+            msg("error: no EFI System Partition with a Windows boot manager"
+                " found.");
+            return 1;
+        }
+        for (i = 0; i < nvol; i++) {
+            msg("  ESP %d: %ls", i + 1, vols[i]);
+            wrote = 0;
+            if (esp_inject(vols[i], donor, &wrote)) done = 1;
+        }
+    }
+
+    if (done) {
+        msg("Boot manager updated on %s ESP(s).", espletter ? "the" : "all found");
+        msg("NOTE: boot-file changes alter Secure Boot measurements - have");
+        msg("      BitLocker recovery keys ready for the first reboot.");
+        return 0;
+    }
+    msg("No boot files were updated.");
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
 
 static int usage(void)
 {
@@ -808,6 +1041,9 @@ static int usage(void)
 "                                    OS if no drive, offline OS at X:\\ otherwise\n"
 "  genpe optin [X:] [--mask 0x5944]  Set AvailableUpdates so OS servicing applies\n"
 "                                    the certs on next boot\n"
+"  genpe bootfiles --yes             Copy a 2023-signed boot manager onto the ESP\n"
+"      --from <dir-or-file>            donor bootmgfw.efi (auto-detected if omitted)\n"
+"      --esp X:                        only this ESP (default: all Windows ESPs)\n"
 "  genpe dump [name [out.bin]]       List / extract an embedded signed payload\n"
 "  genpe apply <PK|KEK|db|dbx> file  Apply an external signed payload (--yes;\n"
 "                                    --replace to overwrite instead of append)\n"
@@ -835,6 +1071,7 @@ int wmain(int argc, WCHAR **argv)
     if (!wcscmp(argv[1], L"install")) return cmd_install(argc - 2, argv + 2);
     if (!wcscmp(argv[1], L"mark")) return cmd_mark_optin(argc - 2, argv + 2, 0);
     if (!wcscmp(argv[1], L"optin")) return cmd_mark_optin(argc - 2, argv + 2, 1);
+    if (!wcscmp(argv[1], L"bootfiles")) return cmd_bootfiles(argc - 2, argv + 2);
     if (!wcscmp(argv[1], L"dump")) return cmd_dump(argc - 2, argv + 2);
     if (!wcscmp(argv[1], L"apply")) return cmd_apply(argc - 2, argv + 2);
     if (!wcscmp(argv[1], L"help") || !wcscmp(argv[1], L"-h") ||
