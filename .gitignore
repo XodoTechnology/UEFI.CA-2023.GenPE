@@ -1,0 +1,4 @@
+build/
+src/generated/payloads.h
+src/generated/payloads.S
+*.o
