@@ -1,11 +1,13 @@
 # GenPE — UEFI CA 2023 Secure Boot updater for Windows / WinPE
 
-A single, dependency-free `GenPE.exe` (~1.6 MB, imports only `kernel32.dll`,
-`advapi32.dll`, `msvcrt.dll`) that enrolls the **Microsoft 2023 Secure Boot
-certificates** into UEFI firmware and marks Windows installs — online or
-offline — as updated. Built to run from a **custom Windows PE disk** so you can
-service machines that haven't received the update through Windows Update,
-machines that were imaged/upgraded offline, and everything in between.
+A single, dependency-free `GenPE.exe` (~1.6 MB, imports only Windows system
+DLLs — `kernel32`, `advapi32`, `user32`, `gdi32`, `comctl32`, `msvcrt`) that
+enrolls the **Microsoft 2023 Secure Boot certificates** into UEFI firmware,
+installs the 2023-signed boot manager onto the ESP, and marks Windows installs
+— online or offline — as updated. Built to run from a **custom Windows PE
+disk** so you can service machines that haven't received the update through
+Windows Update, machines that were imaged/upgraded offline, and everything in
+between. GUI or CLI, same exe.
 
 ## Why
 
@@ -90,26 +92,29 @@ X:\> GenPE.exe optin D:        :: writes AvailableUpdates=0x5944 into D:'s SYSTE
 ### Boot manager update (`bootfiles`)
 
 Certificates alone don't change what the machine boots — for that you need a
-2023-signed `bootmgfw.efi` on the ESP. `genpe bootfiles --yes`:
+2023-signed `bootmgfw.efi` on the ESP. `genpe bootfiles`:
 
-1. Finds a donor: `--from <dir-or-file>`, or auto-detects the first
-   `\Windows\Boot\EFI\bootmgfw.efi` (or `efi\microsoft\boot` on media) on any
-   drive that passes **full Authenticode verification** — the tool parses the
-   PKCS#7 SignedData, RSA-verifies the signature over the signed attributes,
-   checks `messageDigest`, confirms the signed content embeds *this file's*
-   Authenticode PE hash, and verifies the certificate chain hop-by-hop up to
-   a CA that is enrolled in the device's `db` (or a known 2023 CA). Unsigned
-   files, 2011-signed files and forged signatures are all rejected, with a
-   reason shown when run with `-v`-style detail.
-2. Refuses to run unless a 2023 CA is already enrolled in `db` (`--force`
+1. **Read-only first pass** (no `--yes` needed): enumerates every ESP holding
+   `\EFI\Microsoft\Boot\bootmgfw.efi` via volume GUIDs (no drive letter
+   needed, works in WinPE) and verifies its signature. Already 2023-signed?
+   It says so and exits — nothing to do.
+2. For outdated ESPs it finds a donor: `--from <dir-or-file>`, or auto-detects
+   a `bootmgfw.efi` in `\Windows\Boot\EFI` / `efi\microsoft\boot` on any drive
+   **or on another ESP** — any file that passes **full Authenticode
+   verification**: the tool parses the PKCS#7 SignedData, RSA-verifies the
+   signature over the signed attributes, checks `messageDigest`, confirms the
+   signed content embeds *this file's* Authenticode PE hash, and verifies the
+   certificate chain hop-by-hop up to a **2023 CA** enrolled in the device's
+   `db` (or a known 2023 CA). Unsigned, 2011-signed and forged files are all
+   rejected with a reason.
+3. Refuses to deploy unless a 2023 CA is enrolled in `db` (`--force`
    overrides) — installing a loader the firmware can't verify bricks boot.
-3. Enumerates every ESP containing `\EFI\Microsoft\Boot\bootmgfw.efi` via
-   volume GUIDs (no drive letter needed, works in WinPE), backs each file up
-   as `.genpebak`, then updates `bootmgfw.efi` and the `bootx64.efi` fallback
-   if present.
+4. Backs each original up as `.genpebak`, then updates `bootmgfw.efi` and the
+   `bootx64.efi` fallback if present — **only on the ESPs that were outdated**.
 
 Typical donor sources: an already-updated Windows install
-(`D:\Windows\Boot\EFI`), 2023-refreshed install media, or the running OS.
+(`D:\Windows\Boot\EFI`), 2023-refreshed install media, or another ESP that
+Microsoft servicing already updated.
 
 ### Offline OS marking
 
@@ -149,7 +154,9 @@ On Windows with mingw-w64 installed, the same Makefile works under MSYS2.
 ## Layout
 
 ```
-src/genpe.c        the tool (UEFI var I/O, registry, ESP update, CLI)
+src/genpe.c        the tool (UEFI var I/O, registry, ESP update, CLI + GUI)
+src/genpe.rc       resource: embeds the manifest
+src/genpe.manifest requireAdministrator + DPI awareness
 src/sigparse.h     EFI_SIGNATURE_LIST parsing + PK->KEK map lookup
 src/sigcheck.h     PKCS#7/Authenticode signature + chain verification
 src/der.h          minimal ASN.1/DER reader
