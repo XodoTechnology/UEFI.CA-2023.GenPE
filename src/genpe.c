@@ -49,6 +49,8 @@
 #define OPTIN_MASK  0x5944
 
 static int g_verbose;
+static int g_dryrun;
+static int g_json;
 
 /* when set (GUI mode), all output goes here instead of stdout/stderr */
 static void (*g_msgfn)(const char *line);
@@ -171,6 +173,12 @@ static int set_var_append(LPCWSTR name, LPCWSTR guid,
     };
     DWORD e = ERROR_INVALID_FUNCTION;
     size_t i;
+    if (g_dryrun) {
+        msg("    [dry-run] would append %lu bytes to %ls", (unsigned long)len,
+            name);
+        if (err) *err = 0;
+        return TRUE;
+    }
     for (i = 0; i < sizeof(combos) / sizeof(combos[0]); i++) {
         SetLastError(0);
         if (SetFirmwareEnvironmentVariableExW(name, guid, (PVOID)data, len,
@@ -197,6 +205,12 @@ static int set_var_replace(LPCWSTR name, LPCWSTR guid,
     };
     DWORD e = ERROR_INVALID_FUNCTION;
     size_t i;
+    if (g_dryrun) {
+        msg("    [dry-run] would REPLACE %lu bytes in %ls", (unsigned long)len,
+            name);
+        if (err) *err = 0;
+        return TRUE;
+    }
     for (i = 0; i < sizeof(combos) / sizeof(combos[0]); i++) {
         SetLastError(0);
         if (SetFirmwareEnvironmentVariableExW(name, guid, (PVOID)data, len,
@@ -231,14 +245,24 @@ static int uefi_available(void)
 
 static void reg_set_dword(HKEY k, LPCWSTR name, DWORD v)
 {
-    LONG e = RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof(v));
+    LONG e;
+    if (g_dryrun) {
+        msg("    [dry-run] would set %ls = 0x%08lx", name, (unsigned long)v);
+        return;
+    }
+    e = RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof(v));
     if (e) msg("    ! failed to set %ls (err %ld)", name, (long)e);
 }
 
 static void reg_set_sz(HKEY k, LPCWSTR name, LPCWSTR v)
 {
-    LONG e = RegSetValueExW(k, name, 0, REG_SZ, (const BYTE *)v,
-                            (DWORD)((wcslen(v) + 1) * sizeof(WCHAR)));
+    LONG e;
+    if (g_dryrun) {
+        msg("    [dry-run] would set %ls = \"%ls\"", name, v);
+        return;
+    }
+    e = RegSetValueExW(k, name, 0, REG_SZ, (const BYTE *)v,
+                       (DWORD)((wcslen(v) + 1) * sizeof(WCHAR)));
     if (e) msg("    ! failed to set %ls (err %ld)", name, (long)e);
 }
 
@@ -865,16 +889,54 @@ static const char *verify_efi(const WCHAR *path)
     return r;
 }
 
+/* boot-manager paths tried on an ESP, in priority order.  bootmgfw.efi is
+ * x64, bootaa64.efi is ARM64; bootx64/bootaa64 under EFI\Boot\ are the
+ * removable-media fallbacks.  esp_inject only touches paths that already
+ * exist, so arch-appropriate files are never clobbered. */
+static const WCHAR *const BOOT_RELS[] = {
+    L"EFI\\Microsoft\\Boot\\bootmgfw.efi",
+    L"EFI\\Microsoft\\Boot\\bootaa64.efi",
+    L"EFI\\Boot\\bootx64.efi",
+    L"EFI\\Boot\\bootaa64.efi",
+};
+#define NBOOT_RELS (sizeof(BOOT_RELS) / sizeof(BOOT_RELS[0]))
+
+/* first existing boot-manager path under a volume root; returns index or -1 */
+static int esp_boot_path(const WCHAR *volroot, WCHAR *out, int cap)
+{
+    size_t i;
+    for (i = 0; i < NBOOT_RELS; i++) {
+        _snwprintf(out, cap, L"%ls%ls", volroot, BOOT_RELS[i]);
+        if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES)
+            return (int)i;
+    }
+    return -1;
+}
+
 /* enumerate \\?\Volume{guid}\ paths containing a Windows boot manager */
 static int find_windows_esps(WCHAR vols[][64], int max)
 {
-    WCHAR v[64];
+    WCHAR v[64], p[MAX_PATH];
     HANDLE h = FindFirstVolumeW(v, 64);
     int n = 0;
     if (h == INVALID_HANDLE_VALUE) return 0;
     do {
-        WCHAR p[MAX_PATH];
-        _snwprintf(p, MAX_PATH, L"%lsEFI\\Microsoft\\Boot\\bootmgfw.efi", v);
+        if (esp_boot_path(v, p, MAX_PATH) >= 0 && n < max)
+            wcscpy(vols[n++], v);
+    } while (FindNextVolumeW(h, v, 64) && n < max);
+    FindVolumeClose(h);
+    return n;
+}
+
+/* enumerate all volumes that have an EFI directory (for restore) */
+static int find_esps_all(WCHAR vols[][64], int max)
+{
+    WCHAR v[64], p[MAX_PATH];
+    HANDLE h = FindFirstVolumeW(v, 64);
+    int n = 0;
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        _snwprintf(p, MAX_PATH, L"%lsEFI", v);
         if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES && n < max)
             wcscpy(vols[n++], v);
     } while (FindNextVolumeW(h, v, 64) && n < max);
@@ -884,16 +946,17 @@ static int find_windows_esps(WCHAR vols[][64], int max)
 
 static int esp_inject(const WCHAR *volroot, const WCHAR *donor, int *wrote)
 {
-    static const WCHAR *targets[] = {
-        L"EFI\\Microsoft\\Boot\\bootmgfw.efi",
-        L"EFI\\Boot\\bootx64.efi",
-    };
     size_t i;
-    for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+    for (i = 0; i < NBOOT_RELS; i++) {
         WCHAR dst[MAX_PATH], bak[MAX_PATH];
-        _snwprintf(dst, MAX_PATH, L"%ls%ls", volroot, targets[i]);
+        _snwprintf(dst, MAX_PATH, L"%ls%ls", volroot, BOOT_RELS[i]);
         if (GetFileAttributesW(dst) == INVALID_FILE_ATTRIBUTES) continue;
         _snwprintf(bak, MAX_PATH, L"%ls.genpebak", dst);
+        if (g_dryrun) {
+            msg("      [dry-run] would update %ls (backup %ls)", dst, bak);
+            (*wrote)++;
+            continue;
+        }
         if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES &&
             !CopyFileW(dst, bak, TRUE)) {
             msg("      ! backup of %ls failed (err %lu) - skipping", dst,
@@ -925,12 +988,14 @@ static int find_donor(WCHAR out[MAX_PATH])
     WCHAR letter, p[MAX_PATH], vols[16][64];
     static const WCHAR *rel[] = {
         L"\\Windows\\Boot\\EFI\\bootmgfw.efi",
+        L"\\Windows\\Boot\\EFI\\bootaa64.efi",
         L"\\efi\\microsoft\\boot\\bootmgfw.efi",
+        L"\\efi\\microsoft\\boot\\bootaa64.efi",
     };
     size_t r;
     int nv, i;
     for (letter = L'C'; letter <= L'Z'; letter++)
-        for (r = 0; r < 2; r++) {
+        for (r = 0; r < sizeof(rel) / sizeof(rel[0]); r++) {
             _snwprintf(p, MAX_PATH, L"%lc:%ls", letter, rel[r]);
             if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES &&
                 is_2023_ca(verify_efi(p))) {
@@ -940,9 +1005,8 @@ static int find_donor(WCHAR out[MAX_PATH])
         }
     nv = find_windows_esps(vols, 16);
     for (i = 0; i < nv; i++) {
-        _snwprintf(p, MAX_PATH, L"%lsEFI\\Microsoft\\Boot\\bootmgfw.efi",
-                   vols[i]);
-        if (is_2023_ca(verify_efi(p))) {
+        if (esp_boot_path(vols[i], p, MAX_PATH) >= 0 &&
+            is_2023_ca(verify_efi(p))) {
             wcscpy(out, p);
             return 1;
         }
@@ -983,8 +1047,12 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
     for (i = 0; i < nvol; i++) {
         WCHAR p[MAX_PATH];
         const char *ca;
-        _snwprintf(p, MAX_PATH, L"%lsEFI\\Microsoft\\Boot\\bootmgfw.efi",
-                   vols[i]);
+        if (esp_boot_path(vols[i], p, MAX_PATH) < 0) {
+            msg("  ESP %d %ls: no boot manager found - skipping", i + 1,
+                vols[i]);
+            outdated[i] = 0;
+            continue;
+        }
         ca = verify_efi(p);
         outdated[i] = !is_2023_ca(ca);
         if (!outdated[i])
@@ -1075,6 +1143,114 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
     return 1;
 }
 
+/* restore .genpebak boot-file backups on ESPs */
+static int cmd_restore(int argc, WCHAR **argv)
+{
+    const WCHAR *espletter = NULL;
+    WCHAR vols[16][64], p[MAX_PATH], bak[MAX_PATH];
+    int i, nvol, nrest = 0;
+
+    for (i = 0; i < argc; i++)
+        if (!wcscmp(argv[i], L"--esp") && i + 1 < argc) espletter = argv[++i];
+
+    msg("Restore backed-up boot files (.genpebak)");
+    msg("======================================");
+
+    if (!is_elevated()) { msg("error: run elevated."); return 1; }
+
+    if (espletter) {
+        _snwprintf(vols[0], 64, L"%ls\\", espletter);
+        nvol = 1;
+    } else {
+        nvol = find_esps_all(vols, 16);
+        if (!nvol) { msg("error: no EFI System Partitions found."); return 1; }
+    }
+
+    if (!confirm_yes(argc, argv)) {
+        msg("This overwrites boot files with their .genpebak backups.");
+        msg("Re-run with --yes to proceed.");
+        return 2;
+    }
+
+    for (i = 0; i < nvol; i++) {
+        size_t k;
+        for (k = 0; k < NBOOT_RELS; k++) {
+            _snwprintf(p, MAX_PATH, L"%ls%ls", vols[i], BOOT_RELS[k]);
+            _snwprintf(bak, MAX_PATH, L"%ls.genpebak", p);
+            if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES) continue;
+            if (g_dryrun) {
+                msg("  [dry-run] would restore %ls -> %ls", bak, p);
+            } else if (CopyFileW(bak, p, FALSE)) {
+                msg("  restored %ls", p);
+            } else {
+                msg("  ! restore of %ls failed (err %lu)", p,
+                    (unsigned long)GetLastError());
+                continue;
+            }
+            nrest++;
+        }
+    }
+    msg(nrest ? "Restored %d file(s). Backups (.genpebak) kept in place."
+              : "No .genpebak backups found on the ESPs.", nrest);
+    return nrest ? 0 : 1;
+}
+
+/* one-shot fleet mode: firmware install -> boot files -> OS mark.
+ * optional positional drive letter marks that offline OS instead of the
+ * running one.  --json emits a machine-readable summary line. */
+static int cmd_auto(int argc, WCHAR **argv)
+{
+    const WCHAR *drive = NULL;
+    WCHAR *iargs[8];
+    int ni = 0, i, r_fw, r_bf, r_os = 0;
+    const char *s_fw, *s_bf, *s_os;
+
+    for (i = 0; i < argc; i++) {
+        if (!wcscmp(argv[i], L"--drive") && i + 1 < argc)
+            drive = argv[++i];
+        else if (wcschr(argv[i], L':') && wcslen(argv[i]) <= 4 &&
+                 argv[i][0] >= L'A' && argv[i][0] <= L'Z' &&
+                 !drive)
+            drive = argv[i];
+    }
+
+    msg("Auto mode: install certs -> update boot files -> mark OS%s",
+        drive ? " (offline)" : "");
+    msg("==========================================================");
+
+    if (!confirm_yes(argc, argv)) {
+        msg("Auto mode applies all updates. Re-run with --yes.");
+        return 2;
+    }
+    if (!is_elevated()) { msg("error: run elevated."); return 1; }
+
+    /* firmware: --no-mark when an offline drive is targeted so we don't
+     * mark the running OS by mistake */
+    iargs[ni++] = (WCHAR *)L"--yes";
+    if (drive) iargs[ni++] = (WCHAR *)L"--no-mark";
+    r_fw = cmd_install(ni, iargs);
+    s_fw = r_fw == 0 ? "ok" : r_fw == 2 ? "skipped" : "fail";
+
+    iargs[0] = (WCHAR *)L"--yes";
+    r_bf = cmd_bootfiles(1, iargs);
+    s_bf = r_bf == 0 ? "ok" : "fail";
+
+    if (drive) {
+        r_os = mark_os(drive, 0, 0, 0);
+        s_os = r_os == 0 ? "ok" : "fail";
+    } else {
+        /* install already marked the running OS on success */
+        s_os = r_fw == 0 ? "ok" : "fail";
+    }
+
+    msg("==========================================================");
+    msg("Summary: firmware=%s bootfiles=%s os=%s", s_fw, s_bf, s_os);
+    if (g_json)
+        msg("{\"firmware\":\"%s\",\"bootfiles\":\"%s\",\"os\":\"%s\"}",
+            s_fw, s_bf, s_os);
+    return (r_fw || r_bf || r_os) ? 1 : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* minimal Win32 GUI (still system DLLs only)                          */
 /* ------------------------------------------------------------------ */
@@ -1083,7 +1259,8 @@ static int cmd_bootfiles(int argc, WCHAR **argv)
 
 enum {
     IDC_STATUS = 1001, IDC_INSTALL, IDC_BOOTFILES, IDC_SCAN,
-    IDC_MARK, IDC_OPTIN, IDC_DRIVE, IDC_LOG, IDC_REFRESH
+    IDC_MARK, IDC_OPTIN, IDC_DRIVE, IDC_LOG, IDC_REFRESH,
+    IDC_AUTO, IDC_RESTORE
 };
 
 static HWND g_logedit, g_driveedit, g_hwnd;
@@ -1177,6 +1354,23 @@ static LRESULT CALLBACK gui_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             a[0] = d;
             gui_exec_argv(gui_optin_wrap, 1, a);
             break;
+        case IDC_AUTO:
+            if (gui_yes(L"Run the full update now?\n\n"
+                        L"1. Install 2023 CA certificates (KEK + db)\n"
+                        L"2. Update boot files on all ESPs\n"
+                        L"3. Mark the running OS as updated\n\n"
+                        L"BitLocker recovery keys recommended before reboot.")) {
+                a[0] = L"--yes";
+                gui_exec_argv(cmd_auto, 1, a);
+            }
+            break;
+        case IDC_RESTORE:
+            if (gui_yes(L"Restore boot files from .genpebak backups "
+                        L"on all ESPs?")) {
+                a[0] = L"--yes";
+                gui_exec_argv(cmd_restore, 1, a);
+            }
+            break;
         }
     } else if (m == WM_DESTROY) {
         PostQuitMessage(0);
@@ -1215,7 +1409,7 @@ static int gui_main(void)
         L"GenPE - UEFI CA 2023 Secure Boot updater",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
         WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 700, 520,
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 520,
         NULL, NULL, wc.hInstance, NULL);
 
     norm = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -1233,11 +1427,13 @@ static int gui_main(void)
                      72, 64, 40, 22, IDC_DRIVE);
     mk(h, L"BUTTON", L"Mark OS updated", 0, 118, 64, 130, 26, IDC_MARK);
     mk(h, L"BUTTON", L"Opt-in OS updates", 0, 254, 64, 130, 26, IDC_OPTIN);
+    mk(h, L"BUTTON", L"Auto (all steps)", 0, 396, 64, 130, 26, IDC_AUTO);
+    mk(h, L"BUTTON", L"Restore backups", 0, 532, 64, 130, 26, IDC_RESTORE);
 
     g_logedit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
         ES_AUTOVSCROLL,
-        10, 100, 664, 360, h, (HMENU)IDC_LOG, NULL, NULL);
+        10, 100, 774, 360, h, (HMENU)IDC_LOG, NULL, NULL);
 
     {
         HWND c = NULL;
@@ -1281,10 +1477,15 @@ static int usage(void)
 "  genpe bootfiles --yes             Copy a 2023-signed boot manager onto the ESP\n"
 "      --from <dir-or-file>            donor bootmgfw.efi (auto-detected if omitted)\n"
 "      --esp X:                        only this ESP (default: all Windows ESPs)\n"
+"  genpe restore [--esp X:] [--yes]  Restore .genpebak boot-file backups\n"
+"  genpe auto [X:] --yes [--json]    Full sequence: certs -> boot files -> OS mark\n"
+"                                    (X: marks that offline OS instead)\n"
 "  genpe dump [name [out.bin]]       List / extract an embedded signed payload\n"
 "  genpe apply <PK|KEK|db|dbx> file  Apply an external signed payload (--yes;\n"
 "                                    --replace to overwrite instead of append)\n"
 "\n"
+"Global flags: --dry-run (show writes without performing them), --json\n"
+"(machine-readable summary for 'auto'), -v (debug).  x64 and ARM64 builds.\n"
 "All firmware writes are authenticated append writes using Microsoft's signed\n"
 "payloads (github.com/microsoft/secureboot_objects). KEK updates are matched\n"
 "to the device's enrolled Platform Key. Requires admin + UEFI boot.");
@@ -1294,11 +1495,14 @@ static int usage(void)
 int wmain(int argc, WCHAR **argv)
 {
     int i;
-    for (i = 1; i < argc; i++)
-        if (!wcscmp(argv[i], L"-v") || !wcscmp(argv[i], L"--verbose")) {
+    for (i = 1; i < argc; i++) {
+        if (!wcscmp(argv[i], L"-v") || !wcscmp(argv[i], L"--verbose"))
             g_verbose = 1;
-            break;
-        }
+        else if (!wcscmp(argv[i], L"--dry-run"))
+            g_dryrun = 1;
+        else if (!wcscmp(argv[i], L"--json"))
+            g_json = 1;
+    }
 
     grab_privileges();
 
@@ -1310,6 +1514,8 @@ int wmain(int argc, WCHAR **argv)
     if (!wcscmp(argv[1], L"mark")) return cmd_mark_optin(argc - 2, argv + 2, 0);
     if (!wcscmp(argv[1], L"optin")) return cmd_mark_optin(argc - 2, argv + 2, 1);
     if (!wcscmp(argv[1], L"bootfiles")) return cmd_bootfiles(argc - 2, argv + 2);
+    if (!wcscmp(argv[1], L"restore")) return cmd_restore(argc - 2, argv + 2);
+    if (!wcscmp(argv[1], L"auto")) return cmd_auto(argc - 2, argv + 2);
     if (!wcscmp(argv[1], L"dump")) return cmd_dump(argc - 2, argv + 2);
     if (!wcscmp(argv[1], L"apply")) return cmd_apply(argc - 2, argv + 2);
     if (!wcscmp(argv[1], L"help") || !wcscmp(argv[1], L"-h") ||

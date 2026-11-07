@@ -54,10 +54,19 @@ genpe optin [X:] [--mask 0x5944]  Set AvailableUpdates so OS servicing applies
 genpe bootfiles --yes             Copy a 2023-signed boot manager onto the ESP
     --from <dir-or-file>            donor bootmgfw.efi (auto-detected if omitted)
     --esp X:                        only this ESP (default: all Windows ESPs)
+genpe restore [--esp X:] [--yes]  Restore .genpebak boot-file backups
+genpe auto [X:] --yes [--json]    Full sequence: certs -> boot files -> OS mark
+                                  (X: marks that offline OS instead; --json
+                                  prints a machine-readable summary)
 genpe dump [name [out.bin]]       List / extract an embedded signed payload
 genpe apply <PK|KEK|db|dbx> file  Apply an external signed payload (--yes;
                                   --replace to overwrite instead of append)
 ```
+
+Global flags: `--dry-run` (print every firmware/registry/file write without
+performing it), `--json` (JSON summary for `auto`), `-v` (debug output).
+Binaries are built for **x64 and ARM64** (`GenPE.exe`, `GenPE-arm64.exe`);
+ARM64 ESPs use `bootaa64.efi`, which `bootfiles`/`restore` handle too.
 
 ### Typical WinPE flow
 
@@ -67,6 +76,12 @@ X:\> GenPE.exe install --yes    :: KEK 2023 + Windows UEFI CA 2023 + MS UEFI CA 
 X:\> GenPE.exe bootfiles --yes  :: swap in the 2023-signed boot manager on the ESP
 X:\> GenPE.exe scan             :: find offline Windows installs on the disks
 X:\> GenPE.exe mark C:          :: tell that OS it's updated (writes its registry)
+```
+
+Or the one-shot fleet path:
+
+```bat
+X:\> GenPE.exe auto --yes --json :: certs + boot files + OS mark, JSON summary
 ```
 
 Or, to leave the firmware alone and let an offline OS update itself at next
@@ -142,8 +157,9 @@ servicing performs the rollout at first boot.
 Linux cross-compile (only needs `gcc-mingw-w64` + `python3`):
 
 ```sh
-make            # build/GenPE.exe    (x64)
-make x86        # build/GenPE32.exe  (x86, if i686-w64-mingw32-gcc present)
+make            # build/GenPE.exe         (x64)
+make x86        # build/GenPE32.exe       (x86, if i686-w64-mingw32-gcc present)
+make arm64      # build/GenPE-arm64.exe   (ARM64, if aarch64-w64-mingw32-gcc present)
 make test       # run the parser/map unit tests natively against real payloads
 ```
 
