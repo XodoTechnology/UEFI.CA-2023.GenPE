@@ -35,7 +35,13 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-aarch64 python3
+          sudo apt-get install -y python3 xz-utils
+      - name: Install llvm-mingw (aarch64 windows target)
+        run: |
+          curl -fsSL -o /tmp/llvm-mingw.tar.xz \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar xf /tmp/llvm-mingw.tar.xz -C /opt
+          echo "/opt/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
       - name: Build ARM64 exe
         run: make arm64
       - uses: actions/upload-artifact@v4

@@ -172,7 +172,6 @@ static int x509_parse(const unsigned char *der, size_t n, xcrt_t *c)
 {
     const unsigned char *p = der, *end = der + n;
     der_t cert, tbs, el, bs, seq, ni, ei;
-    int idx;
 
     memset(c, 0, sizeof(*c));
     c->verified_by = -1;
@@ -186,8 +185,8 @@ static int x509_parse(const unsigned char *der, size_t n, xcrt_t *c)
     /* walk TBSCertificate children; SEQ siblings are told apart by their
      * first child's tag: 0x31 SET -> Name, 0x06 OID -> sig algorithm,
      * 0x17/0x18 time -> validity, 0x30 SEQ -> subjectPublicKeyInfo */
-    p = tbs.val; end = tbs.val + tbs.vlen;
-    for (idx = 0; p < end && der_iter(&p, end, &el); idx++) {
+    for (p = tbs.val, end = tbs.val + tbs.vlen;
+         p < end && der_iter(&p, end, &el);) {
         der_t k;
         if (el.tag == 0xa0 || el.tag == 0xa1 || el.tag == 0xa2 ||
             el.tag == 0xa3)

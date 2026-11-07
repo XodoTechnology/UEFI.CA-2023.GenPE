@@ -159,7 +159,9 @@ Linux cross-compile (only needs `gcc-mingw-w64` + `python3`):
 ```sh
 make            # build/GenPE.exe         (x64)
 make x86        # build/GenPE32.exe       (x86, if i686-w64-mingw32-gcc present)
-make arm64      # build/GenPE-arm64.exe   (ARM64, if aarch64-w64-mingw32-gcc present)
+make arm64      # build/GenPE-arm64.exe   (ARM64 via llvm-mingw — no distro
+                                        #  mingw-w64 aarch64 package exists;
+                                        #  CI downloads it automatically)
 make test       # run the parser/map unit tests natively against real payloads
 ```
 

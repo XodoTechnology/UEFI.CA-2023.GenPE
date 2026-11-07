@@ -1,11 +1,12 @@
 # GenPE - UEFI CA 2023 Secure Boot updater
 # Cross-compile:  make            (needs x86_64-w64-mingw32-gcc + python3)
 # 32-bit:         make x86        (needs i686-w64-mingw32-gcc)
-# ARM64:          make arm64      (needs aarch64-w64-mingw32-gcc)
+# ARM64:          make arm64      (llvm-mingw: aarch64-w64-mingw32-clang;
+#                                no distro mingw-w64 aarch64 package exists)
 
 X64CC   ?= x86_64-w64-mingw32-gcc
 X86CC   ?= i686-w64-mingw32-gcc
-ARM64CC ?= aarch64-w64-mingw32-gcc
+ARM64CC ?= aarch64-w64-mingw32-clang
 CFLAGS   = -Os -Wall -Wextra -Wno-unused-parameter -Isrc
 LDFLAGS  = -municode -static -s -Wl,--gc-sections
 LIBS     = -ladvapi32 -luser32 -lgdi32 -lcomctl32

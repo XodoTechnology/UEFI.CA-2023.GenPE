@@ -21,6 +21,14 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+/* SetFirmwareEnvironmentVariableExW needs _WIN32_WINNT >= 0x0602;
+ * llvm-mingw headers default lower than gcc's */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER 0x0A00
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
